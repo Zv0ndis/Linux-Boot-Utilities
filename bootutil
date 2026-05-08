@@ -1,0 +1,396 @@
+#!/bin/bash
+
+BOOT_ENTRIES_DIR="/boot/loader/entries"
+
+print_list() {
+    local sort_by=""
+    local filter_kernel=""
+    local filter_title=""
+    local OPTIND=1
+
+    # zpracovani prepinacu
+    while getopts "fsk:t:" opt; do
+        case "$opt" in
+            f) sort_by="filename" ;;
+            s) sort_by="sort-key" ;;
+            k) filter_kernel="$OPTARG" ;;
+            t) filter_title="$OPTARG" ;;
+            *) ;;
+        esac
+    done
+    shift $((OPTIND-1))
+
+    # nacteni souboru, ziskani informaci
+    local entries=()
+    while IFS= read -r -d '' file; do
+        [[ -f "$file" ]] || continue
+        title=$(grep -m1 '^title ' "$file" | cut -d' ' -f2-)
+        version=$(grep -m1 '^version ' "$file" | cut -d' ' -f2-)
+        linux=$(grep -m1 '^linux ' "$file" | cut -d' ' -f2-)
+        sortkey=$(grep -m1 '^sort-key ' "$file" | cut -d' ' -f2-) 
+        filename=$(basename "$file")
+        entries+=("$filename|$title|$version|$linux|$sortkey")
+    done < <(find "$BOOT_ENTRIES_DIR" -maxdepth 1 -name '*.conf' -print0)
+
+    # serazeni podle filename
+    if [[ "$sort_by" == "filename" ]]; then
+        IFS=$'\n' sorted_entries=($(
+            printf "%s\n" "${entries[@]}" | 
+            awk -F'|' '{
+                match($1, /^[^0-9]*([0-9]+)/, arr);
+                num = arr[1] ? arr[1] : 999;
+                print num "|" $0
+            }' |
+            sort -t'|' -k1,1n -k2,2 |
+            cut -d'|' -f2-
+        ))
+        entries=("${sorted_entries[@]}")
+    # serazeni podle sort-key
+    elif [[ "$sort_by" == "sort-key" ]]; then
+        IFS=$'\n' sorted_entries=($(
+            printf "%s\n" "${entries[@]}" |
+            awk -F'|' '{
+                sortkey = ($5 == "") ? $1 : $5
+                print sortkey "|" $0
+            }' |
+            sort -t'|' -k1,1V |  
+            cut -d'|' -f2-
+        ))
+        entries=("${sorted_entries[@]}")
+    fi
+
+    # filtrace a formatovani vystupu
+    local output=()
+    for entry in "${entries[@]}"; do
+        IFS='|' read -r filename title version linux sortkey <<< "$entry"
+
+    [[ -n "$filter_title" ]] && ! grep -qE "$filter_title" <<< "$title" && continue
+    [[ -n "$filter_kernel" ]] && ! grep -qE "$filter_kernel" <<< "$linux" && continue
+
+
+        output+=("$title ($version, $linux)")
+    done
+
+    # vypis vysledku
+    local count=${#output[@]}
+    for ((i = 0; i < count; i++)); do
+        [[ $i -gt 0 ]] && printf "\n"
+        printf "%s" "${output[$i]}"
+    done
+    return 0
+}
+
+duplicate() {
+    # lokalni promenne
+    local entry_file_path=""
+    local new_kernel_path=""
+    local new_initramfs_path=""
+    local new_title=""
+    declare -a add_cmdline_args=()
+    declare -a remove_cmdline_args=()
+    local destination=""
+    local make_default=false
+    local args=("$@")
+
+    # nastaveni prepinacu
+    while [[ ${#args[@]} -gt 0 ]]; do
+        case "${args[0]}" in
+            -k)
+                new_kernel_path="${args[1]}"
+                args=("${args[@]:2}")
+                ;;
+            -i)
+                new_initramfs_path="${args[1]}"
+                args=("${args[@]:2}")
+                ;;
+            -t)
+                new_title="${args[1]}"
+                args=("${args[@]:2}")
+                ;;
+            -a)
+                # pridani pouze pokud neni v poli
+                if ! [[ " ${add_cmdline_args[*]} " =~ " ${args[1]} " ]]; then
+                    add_cmdline_args+=("${args[1]}")
+                fi
+                args=("${args[@]:2}")
+                ;;
+            -r)
+                remove_cmdline_args+=("${args[1]}")
+                args=("${args[@]:2}")
+                ;;
+            -d)
+                destination="${args[1]}"
+                args=("${args[@]:2}")
+                ;;
+            --make-default)
+                make_default=true
+                args=("${args[@]:1}")
+                ;;
+            -*)
+                echo "Error: Unknown option ${args[0]}" >&2
+                return 1
+                ;;
+            *)
+                if [[ -z "$entry_file_path" ]]; then
+                    entry_file_path="${args[0]}"
+                    args=("${args[@]:1}")
+                else
+                    echo "Error: Multiple entry files specified" >&2
+                    return 1
+                fi
+                ;;
+        esac
+    done
+
+    # kontrola cesty k souboru ktery kopirujeme
+    if [[ -z "$entry_file_path" ]]; then
+        entry_file_path=$(grep -l '^vutfit_default y' "$BOOT_ENTRIES_DIR"/*.conf 2>/dev/null | head -n1)
+        if [[ -z "$entry_file_path" ]]; then
+            echo "Error: No default entry found and no entry file specified" >&2
+            return 1
+        fi
+    fi
+
+    # soubor nenalezen
+    if [[ ! -f "$entry_file_path" ]]; then
+        echo "Error: Entry file not found: $entry_file_path" >&2
+        return 1
+    fi
+
+    #  pokud je urcena cesta pro vystupni soubor
+    if [[ -z "$destination" ]]; then
+        local base_name=$(basename "$entry_file_path" .conf)
+        local suffix=1
+        while [[ -f "$BOOT_ENTRIES_DIR/${base_name}_dup${suffix}.conf" ]]; do
+            ((suffix++))
+        done
+        destination="$BOOT_ENTRIES_DIR/${base_name}_dup${suffix}.conf"
+    fi
+
+    # vytvoreni docasneho souboru
+    local tmpfile
+    tmpfile=$(mktemp -p "$BOOT_ENTRIES_DIR" tmp.XXXXXXXXXX.conf) || {
+        echo "Error: Failed to create temporary file" >&2
+        return 1
+    }
+
+    # nacteni radku ze souboru
+    while IFS= read -r line; do
+        case "$line" in
+            title*)
+                if [[ -n "$new_title" ]]; then
+                    echo "title $new_title" >> "$tmpfile"
+                else
+                    echo "${line} (copy)" >> "$tmpfile"
+                fi
+                ;;
+            linux*)
+                if [[ -n "$new_kernel_path" ]]; then
+                    echo "linux $new_kernel_path" >> "$tmpfile"
+                else
+                    echo "$line" >> "$tmpfile"
+                fi
+                ;;
+            initrd*)
+                if [[ -n "$new_initramfs_path" ]]; then
+                    echo "initrd $new_initramfs_path" >> "$tmpfile"
+                else
+                    echo "$line" >> "$tmpfile"
+                fi
+                ;;
+            options*)
+                # ulozeni puvodnich moznosti
+                local old_options="${line#options }"
+                local new_options="$old_options"
+                
+                # pridani novych  moznosti pokud nejsou uz napsany
+                for arg in "${add_cmdline_args[@]}"; do
+                    if ! [[ "$new_options" =~ (^|[[:space:]])"${arg}"([[:space:]]|$) ]]; then
+                        new_options="$new_options $arg"
+                    fi
+                done
+                
+                # odstraneni existujicich moznosti 
+                for arg in "${remove_cmdline_args[@]}"; do
+                    local -a opts_array=()
+                    IFS=' ' read -r -a opts_array <<< "$new_options"
+                    new_options=""
+                    for opt in "${opts_array[@]}"; do
+                        if [[ "$opt" != "$arg" ]]; then
+                            new_options="${new_options}${new_options:+ }$opt"
+                        fi
+                    done
+                done
+                
+                # odstraneni zbytecnych mezer 
+                new_options=$(echo "$new_options" | awk '{$1=$1};1')
+                
+                echo "options $new_options" >> "$tmpfile"
+                ;;
+            vutfit_default*)
+                if $make_default; then
+                    find "$BOOT_ENTRIES_DIR" -maxdepth 1 -name '*.conf' ! -name "$(basename "$destination")" \
+                        -exec sed -i 's/^vutfit_default y$/vutfit_default n/' {} +
+                    echo "vutfit_default y" >> "$tmpfile"
+                else
+                    echo "vutfit_default n" >> "$tmpfile"
+                fi
+                ;;
+            *)
+                echo "$line" >> "$tmpfile"
+                ;;
+        esac
+    done < "$entry_file_path"
+
+    # presunuti tmp souboru do ciloveho umisteni
+    if mv "$tmpfile" "$destination"; then
+        echo "Created duplicate entry at: $destination"
+        return 0
+    else
+        echo "Error: Failed to create duplicate entry" >&2
+        rm -f "$tmpfile"
+        return 1
+    fi
+}
+
+remove() {
+    if [[ $# -eq 0 ]]; then
+        echo "Error: Title regex pattern must be specified" >&2
+        return 1
+    fi
+
+    local title_regex="$1"
+    local entry_files=()
+
+    # najiti vsech existujicich shod
+    for file in "$BOOT_ENTRIES_DIR"/*.conf; do
+        [[ -f "$file" ]] || continue
+        local title=$(grep -m1 '^title ' "$file" | cut -d' ' -f2-)
+       if grep -qE "$title_regex" <<< "$title"; then
+            entry_files+=("$file")
+        fi
+    done
+
+    # pokud nenalezeno nic
+    if [[ ${#entry_files[@]} -eq 0 ]]; then
+        echo "No entries found matching pattern: $title_regex" >&2
+        return 1
+    fi
+
+    # smazani
+    for file in "${entry_files[@]}"; do
+        rm -- "$file"
+    done
+    return 0
+}
+
+show-default() {
+    local show_filepath_only=false
+    
+    # zpracovani prepinace
+    while getopts "f" opt; do
+        case "$opt" in
+            f) show_filepath_only=true ;;
+            *) ;;
+        esac
+    done
+    shift $((OPTIND-1))
+
+    # nalezeni defaultniho souboru
+    local default_entry=$(grep -l '^vutfit_default y' "$BOOT_ENTRIES_DIR"/*.conf 2>/dev/null | head -n1)
+    
+    if [[ -z "$default_entry" ]]; then
+        echo "No default boot entry found" >&2
+        return 1
+    fi
+
+    if $show_filepath_only; then
+        echo "$default_entry"
+    else
+        cat "$default_entry"
+    fi
+    
+    return 0
+}
+
+make-default() {
+    if [[ $# -eq 0 ]]; then
+        echo "Error: Entry file path must be specified" >&2
+        return 1
+    fi
+
+    local entry_file_path="$1"
+    
+    # overeni ze soubor existuje
+    if [[ ! -f "$entry_file_path" ]]; then
+        echo "Error: Entry file not found: $entry_file_path" >&2
+        return 1
+    fi
+
+    # zmena default flagu z y na n pro vsechny ostatni soubory
+    find "$BOOT_ENTRIES_DIR" -maxdepth 1 -name '*.conf' ! -name "$(basename "$entry_file_path")" \
+        -exec sed -i 's/^vutfit_default y$/vutfit_default n/' {} +
+    
+    # pridani nebo uprava default flagu
+    if grep -q '^vutfit_default ' "$entry_file_path"; then
+        sed -i 's/^vutfit_default .*$/vutfit_default y/' "$entry_file_path"
+    else
+        echo "vutfit_default y" >> "$entry_file_path"
+    fi
+    
+    echo "Set as default: $(basename "$entry_file_path")"
+    return 0
+}
+
+
+command=""
+declare -a cmd_args=()
+
+# Parse all arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -b)
+            BOOT_ENTRIES_DIR="$2"
+            shift 2
+            ;;
+        list|duplicate|remove|show-default|make-default)
+            # nacteni prvniho prikazu
+            if [[ -z "$command" ]]; then
+                command="$1"
+            else 
+                echo "Error: Multiple commands specified" >&2
+                exit 1
+            fi
+            shift
+            ;;
+        *)
+            # ulozeni zbylich argumentu
+            cmd_args+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# overeni ze command byl zadan
+if [[ -z "$command" ]]; then
+    echo "Error: No command specified" >&2
+    exit 1
+fi
+
+# urceni co se ma stat 
+case "$command" in
+    list)
+        print_list "${cmd_args[@]}" ;;
+    duplicate)
+        duplicate "${cmd_args[@]}" ;;
+    remove)
+        remove "${cmd_args[@]}" ;;
+    show-default)
+        show-default "${cmd_args[@]}" ;;
+    make-default)
+        make-default "${cmd_args[@]}" ;;
+    *)
+        echo "Error: Unknown command '$command'" >&2
+        exit 1
+        ;;
+esac
