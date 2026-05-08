@@ -1,9 +1,17 @@
-# Operating Systems (IOS) - Project 1
+# Operating Systems: Boot Utilities (IOS)
 
-Bootutil - a utility for working with boot records and system information.
+## Overview
+A system-level utility focused on Linux boot records. Implements 'bootutil' to analyze and manipulate system information and boot structures at the disk level.
 
-## Course
-FIT VUT in Brno
+## Key Features
+- Implementation of core algorithms and data structures.
+- Academic project focused on efficiency and code quality.
+- Robust error handling and memory management.
+
+## Course Information
+- **Institution:** Faculty of Information Technology, Brno University of Technology (FIT VUT)
+- **Course:** IOS
 
 ## Author
-Tomáš Zvoníček (xzvonit00)
+- **Name:** Tomáš Zvoníček
+- **Login:** xzvonit00
